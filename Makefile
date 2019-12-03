@@ -1,10 +1,11 @@
 CC=gcc
-CFLAGS=-Wall -Werror -O2
+CFLAGS=-Wall -Werror -g
 INCLUDES=
 LDFLAGS=
-LIBS=-pthread -lrdmacm
+#LIBS=-pthread -lrdmacm
+LIBS=-pthread
 
-SRCS=main.c client.c config.c ib.c server.c setup_ib.c sock.c
+SRCS=main.c client.c config.c ib.c server.c setup_ib.c sock.c libivb.c
 OBJS=$(SRCS:.c=.o)
 PROG=rdma-tutorial
 

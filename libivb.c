@@ -5,7 +5,8 @@
 #include <infiniband/verbs.h>
 
 struct ibv_device **ibv_get_device_list(int *num_devices){
-    *num_devices =1;
+    if ( num_devices)
+        *num_devices =1;
     struct ibv_device *dev = malloc(sizeof( struct ibv_device));
     struct ibv_device **list = calloc( 2, sizeof(*dev));
     list[0] = dev;
@@ -54,7 +55,8 @@ int ibv_destroy_qp(struct ibv_qp *qp) {
 
 int ibv_query_port(struct ibv_context *context, uint8_t port_num,
                         struct ibv_port_attr *port_attr){
-     return 999;
+    port_attr->state=IBV_PORT_ACTIVE; 
+    return 0;
 }
 
 struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr,
