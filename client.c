@@ -56,8 +56,7 @@ void *client_thread_func (void *arg)
     /* wait for start signal */
     while (start_sending != true) {
         do {
-            n = ibv_poll_cq (cq, num_wc, wc);
-        } while (n < 1);
+         } while (n < 1);
         check (n > 0, "thread[%ld]: failed to poll cq", thread_id);
 
         for (i = 0; i < n; i++) {
