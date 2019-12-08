@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-Wall -Werror -g -DDEBUG
+CFLAGS=-Wall -Werror -g3 -o0 -DDEBUG
 INCLUDES=
 LDFLAGS=
 #LIBS=-pthread -lrt -lrdmacm

@@ -11,11 +11,15 @@
 #include <assert.h>
 
 #include <infiniband/verbs.h>
-#define container_of(ptr, type, member) ({                      \
-        const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
+#define container_of(ptr, type, member) ({\
+        const typeof( ((type *)0)->member ) *__mptr = (ptr);\
         (type *)( (char *)__mptr - offsetof(type,member) );})
 
+#ifdef DEBUG
+#define RCV_MAX 4
+#else
 #define RCV_MAX 250
+#endif
 #define PAGE_SIZE 4096
 #define QP_MAX 16
 #define PD_MAX 8
@@ -36,6 +40,7 @@ void ibv_free_device_list(struct ibv_device **list){
     free( list);
 }
 typedef struct _per_wr {
+    enum ibv_wr_opcode wr_opcode;
     struct ibv_sge *sg;
     int wr_shared_mem_fd;
     size_t total_sq_size;
@@ -50,15 +55,15 @@ typedef struct _per_qp {
     struct ibv_pd pd;
     int qp_shared_mem_fd;
     struct ibv_qp *remote_qp; // peer QP
-    
-    
+
+
 } per_qp_t;
 
 /* we need to save MR  and WR  Dor this purpose we extend ibv_context */
 typedef struct __shmem_context {
     int header__mem_fd;
     struct ibv_context context;
-    struct ibv_mr mr_arr[MR_BUFFERS_MAX];  //my buffers which remote  - per connection 
+    struct ibv_mr mr_arr[MR_BUFFERS_MAX];  //my buffers which remote  - per connection
     uint16_t mr_index;
     uint16_t qp_index;
     uint32_t snd_index;
@@ -66,43 +71,52 @@ typedef struct __shmem_context {
     per_qp_t qp_arr[QP_MAX];
     struct ibv_pd pd_arr[PD_MAX];
     sge_of_wr_t sg_arr[RCV_MAX];
-    struct ibv_send_wr snd_wr[RCV_MAX]; // my wrire requests 
-    struct ibv_recv_wr rcv_wr[RCV_MAX];  // // Received  from Peer 
-     
+    struct ibv_send_wr snd_wr[RCV_MAX]; // my wrire requests
+    struct ibv_recv_wr rcv_wr[RCV_MAX];  // // Received  from Peer
+
 } shmem_context_t;
-shmem_context_t *shmem_hdr;  // Global header
+shmem_context_t *shmem_hdr=NULL;  // Global header
 struct ibv_context *ibv_open_device(struct ibv_device *device){
     int fd;
-    
-    fd = shm_open("ibverbs", O_RDONLY|O_CREAT|O_TRUNC, S_IRWXU);
+
+    fd = shm_open("ibverbs", O_RDWR|O_CREAT, S_IRUSR|S_IWUSR|S_IWGRP|S_IRGRP);
     if (fd <= 0) {
-           fprintf(stderr, "Failed shmem_rcv_cqe_mem_%u\n", j);
+           perror( "Failed shmem_ ibverbs\n");
            exit(-1);
     }
-    ftruncate (fd, sizeof(shmem_context_t));
-    shmem_hdr = mmap(NULL, sizeof(shmem_context_t ), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (!shmem_hdr) {
-           fprintf(stderr, "%s :Failed create shmem ibverbs header\n", __func__);
+
+    int rc = truncate ("/dev/shm/ibverbs", sizeof(shmem_context_t));
+    if ( rc < 0 ){
+        perror ("Failed create shmem ibverbs header\n");
+        exit(-1);
+    }
+
+    shmem_hdr = mmap(NULL, sizeof(shmem_context_t), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    if (shmem_hdr == MAP_FAILED) {
+           perror("Failed create shmem ibverbs header\n");
            exit(-1);
     }
+    memset(shmem_hdr, 0, sizeof(shmem_context_t));
     shmem_hdr->header__mem_fd = fd;
-     // Create a smmem for snd/rcv Scatter-Gather list 
+
+     // Create a smmem for snd/rcv Scatter-Gather list
     for ( uint16_t j= 0; j< RCV_MAX; j++){
         char * shname = NULL;
         int rc  = asprintf( &shname,  "shmem_rcv_cqe_mem_%u", j);
         assert (rc > 0);
-        fd = shm_open(shname, O_RDONLY|O_CREAT|O_TRUNC, S_IRWXU);
+        fd = shm_open(shname, O_RDWR|O_CREAT|O_TRUNC, S_IRWXU);
         free(shname);
         if (fd <= 0) {
            fprintf(stderr, "Failed shmem_rcv_cqe_mem_%u\n", j);
            exit(-1);
         }
-        
+
         ftruncate(fd, 0);
         shmem_hdr->sg_arr[j].wr_shared_mem_fd = fd;
         shmem_hdr->sg_arr[j].rcv_signalled = false;
         shmem_hdr->sg_arr[j].total_sq_size = 0;
         shmem_hdr->sg_arr[j].sg = NULL;
+        shmem_hdr->sg_arr[j].mapped_sgs = NULL;
     }
 
     //
@@ -161,8 +175,8 @@ int ibv_destroy_comp_channel(struct ibv_comp_channel *cc){
  * @solicited_only: If non-zero, an event will be generated only for
  *   the next solicited CQ entry.  If zero, any CQ entry, solicited or
  *   not, will generate an event.
- * 
- * @todo :LEV 
+ *
+ * @todo :LEV
  */
 int ibv_req_notify_cq(struct ibv_cq *cq, int solicited_only){
     return 1;
@@ -205,42 +219,23 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd,
 
     shmem_context_t * ctx = container_of(pd->context, shmem_context_t, context);
     struct ibv_qp * qp = NULL;
-    struct ibv_qp * remote_qp = NULL;
-    uint16_t i, j;
+
+    uint16_t i;
     for (  i = 0; i< QP_MAX; i++){
         if ( ctx->qp_arr[i].qp.qp_num == 0) {
             qp = &ctx->qp_arr[i].qp;
             qp->pd = pd;
-            ctx->qp_index++;
-            assert ( ctx->qp_index < QP_MAX);
             qp->qp_num = i;
-            ctx->qp_arr[i].remote_qp = NULL;
-            qp->state = IBV_QPS_RESET;
+            qp->state = IBV_QPS_RTS;
 		    qp->events_completed = 0;
 		    pthread_mutex_init(&qp->mutex, NULL);
 		    pthread_cond_init(&qp->cond, NULL);
+            return qp;
         }
     }
     assert (qp != NULL);
-    // Creatr a pair to QP[i]
-    for ( j = 0; j< QP_MAX; j++){
-        if ( ctx->qp_arr[j].qp.qp_num == 0) {
-
-            remote_qp = &ctx->qp_arr[j].qp;
-            remote_qp->pd = pd;
-            ctx->qp_index++;
-            assert ( ctx->qp_index < QP_MAX);
-            remote_qp->qp_num = j;
-            ctx->qp_arr[i].remote_qp = remote_qp;
-            ctx->qp_arr[j].remote_qp = qp;
-            remote_qp->state = IBV_QPS_RESET;
-		    remote_qp->events_completed = 0;
-		    pthread_mutex_init(&remote_qp->mutex, NULL);
-		    pthread_cond_init(&remote_qp->cond, NULL);
-        }
-    }
-    return qp;
-}                     
+    return NULL;
+}
 
 int ibv_destroy_qp(struct ibv_qp *qp) {
     shmem_context_t * ctx = container_of(qp->context, shmem_context_t, context);
@@ -259,7 +254,7 @@ int ibv_destroy_qp(struct ibv_qp *qp) {
 
 int ibv_query_port(struct ibv_context *context, uint8_t port_num,
                         struct ibv_port_attr *port_attr){
-    port_attr->state=IBV_PORT_ACTIVE; 
+    port_attr->state=IBV_PORT_ACTIVE;
     return 0;
 }
 
@@ -273,11 +268,11 @@ ibv_reg_mr()  registers  a  memory  region  (MR)  associated with the protection
 */
 struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr,
                                  size_t length, int access){
-  
+
    struct ibv_mr *mr = NULL;
    shmem_context_t * ctx = container_of(pd->context, shmem_context_t, context);
    /// Find free slot, each PD thereticlly has its own list of memory regions
-   
+
    for ( uint8_t i = 0; i< MR_BUFFERS_MAX; i++) {
        if ( ctx->mr_arr[i].addr == NULL) {
             mr = &ctx->mr_arr[i];
@@ -328,17 +323,17 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr,
 int  __attribute__((unused)) ibv_query_pkey(struct ibv_context *context, uint8_t port_num,
                           int index, uint16_t *pkey)
 {
-    *pkey=1;                              
+    *pkey=1;
     return 0;
 }
 
 int  __attribute__((unused)) ibv_query_gid(struct ibv_context *context, uint8_t port_num,
                          int index, union ibv_gid *gid)
-{                            
+{
     return 999;
 }
 /*
- Remote WR are registered in the QP snd_wr element 
+ Remote WR are registered in the QP snd_wr element
  Local WR are registered only in QP snd_local count */
 /* Returns only 1 element  for now */
 int  __attribute__((unused)) ibv_poll_cq(struct ibv_cq *cq, int num_entries,
@@ -346,80 +341,83 @@ int  __attribute__((unused)) ibv_poll_cq(struct ibv_cq *cq, int num_entries,
 {
    shmem_context_t * ctx = shmem_hdr;
    uint16_t n;
+   uint16_t found = 0;
 
    assert(num_entries <64*1024);
    //uint16_t qp_num;
    // Scan all QP
   // struct ibv_qp * qp;
    for (uint16_t k = 0; k< QP_MAX; k++){
-        
-        for ( uint16_t i = 0; i< RCV_MAX; i++){
-             
-            // Local snd_wr are sent immediately, i.e mapped to shmem_rcv_X
-            for (n =0; n < num_entries ;n++) {
-                for ( uint16_t i = 0; i< RCV_MAX; i++){
-                    off_t shmem_rcv_len = lseek( ctx->sg_arr[i].wr_shared_mem_fd, 0 , SEEK_CUR);
-                    if ( shmem_rcv_len > 0) {
-                        if (!ctx->sg_arr[i].rcv_signalled) {
-                            fprintf(stderr, "Shmem SQ %i not consumed\n", i);
-                            continue;
-                        }
-                        wc[n].qp_num = ctx->qp_arr[k].qp.qp_num;
-                        wc[n].src_qp = wc->qp_num;
-                        wc[n].opcode = IBV_WC_RECV;
-                        wc[n].status = IBV_WC_SUCCESS;
-                        wc[n].wr_id = ctx->snd_wr[i].wr_id;
-                        wc[n].imm_data = ctx->snd_wr[i].imm_data;
-                    }
-                }
+    // Local snd_wr are sent immediately, i.e mapped to shmem_rcv_X
+    for (n =0; n < num_entries ;n++) {
+        for ( uint16_t i = 0; i< RCV_MAX && (n < num_entries); i++){
+            off_t shmem_rcv_len = lseek( ctx->sg_arr[i].wr_shared_mem_fd, 0 , SEEK_END);
+            if ( shmem_rcv_len > 0) {
+                found++;
+                wc[n].qp_num = ctx->qp_arr[k].qp.qp_num;
+                wc[n].src_qp = wc->qp_num;
+                wc[n].opcode = ctx->sg_arr[i].wr_opcode;
+                wc[n].status = IBV_WC_SUCCESS;
+                wc[n].wr_id = ctx->snd_wr[i].wr_id;
+                wc[n].imm_data = ctx->snd_wr[i].imm_data;
+                ctx->sg_arr[i].rcv_signalled = true;
             }
-            for (; n < num_entries ;n++) {
-                // So rcv side has access to datam but how do i know when to release it?
+        }
+    }
+    }
+    for (uint16_t k = 0; k< QP_MAX; k++){
+        for (; n < num_entries ;n++) {
+            for ( uint16_t i = 0; i< RCV_MAX && (n < num_entries); i++){
+                // So rcv side has access to data but how do i know when to release it?
                 // I will release after signalled=true
-                off_t shmem_rcv_len = lseek( ctx->sg_arr[i].wr_shared_mem_fd, 0 , SEEK_CUR);
+                off_t shmem_rcv_len = lseek( ctx->sg_arr[i].wr_shared_mem_fd, 0 , SEEK_END);
                 if ( shmem_rcv_len > 0) {
+                    found++;
                     wc[n].qp_num = ctx->qp_arr[k].qp.qp_num;
                     wc[n].vendor_err = 0;
                     wc[n].src_qp = wc->qp_num;
-                    wc[n].opcode = IBV_WC_SEND;
+                    wc[n].opcode = ctx->sg_arr[i].wr_opcode;
                     wc[n].status = IBV_WC_SUCCESS;
                     wc[n].wr_id = ctx->snd_wr[i].wr_id;
                     wc[n].imm_data = ctx->snd_wr[i].imm_data;
-                    
+
                     ctx->sg_arr[i].rcv_signalled = true;
                     // ? wc->sl = 1;
                     // ? wc->slid = 1;
                     // ? wc->pkey_index = 1;
-               // ctx->snd_wr[i] = NULL; 
-                    return 1;
+               // ctx->snd_wr[i] = NULL;
+                    return n;
                 }
             }
-            
+
         }
    }
    return -1;
 }
 
-/* So we mapped SG element to SHMEM 
+/* So we mapped SG element to SHMEM
  Q : should it be per QP ?
 */
-int  __attribute__((unused)) ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
+ int ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
 				struct ibv_recv_wr **bad_wr)
 {
-    // jusr preparing to send
+    // just preparing to send
     return 0;
 }
-/* I am willimg to send, place WR into remote peer rcv buf */ 
-int  __attribute__((unused)) ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
+/*
+ I am willing to send, place WR into remote peer rcv buf 
+ */
+int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
 				struct ibv_send_wr **bad_wr)
 {
     shmem_context_t * ctx = shmem_hdr;
     char * sg_ptr;
     // Find free snd slot to place write request
     // free slot is when completed Reception  from Peer is signalled
-    for (uint16_t j=0; j < RCV_MAX; j++) {
+    for (uint16_t j=0; j < RCV_MAX; j++)
+    {
         // ctx->rcv_wr, snd_wr must be in shared mem;
-        if (!ctx->sg_arr[j].rcv_signalled) {
+        if ( ctx->sg_arr[j].mapped_sgs && (!ctx->sg_arr[j].rcv_signalled)) {
             fprintf(stderr, "POST_RECV Shmem SQ %i not consumed\n", j);
             continue;
         }
@@ -427,34 +425,43 @@ int  __attribute__((unused)) ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr
         ctx->snd_wr[j].wr_id = wr->wr_id;
         ctx->snd_wr[j].imm_data = wr->imm_data;
         sg_ptr = NULL;
-        // Now  mmap SQ list addresses into shared mem
-        
-        // signalled == true, we can reuse 
-        ftruncate(ctx->sg_arr[j].wr_shared_mem_fd, 0);
-        sg_ptr = mmap((uint64_t *)wr->sg_list->addr, 
-                wr->sg_list->length,
-                PROT_READ|PROT_WRITE, MAP_SHARED,
-                ctx->sg_arr[j].wr_shared_mem_fd,
-                ctx->sg_arr[j].total_sq_size);
-        // todo make a list remmapped to shared mem
-        if (sg_ptr == NULL) {
-             fprintf(stderr, "%s Failed to mmap SG \n", __func__ );
-            exit(-1);
+
+        if ( wr->opcode == IBV_WR_SEND_WITH_IMM ) {
+            sg_ptr = (void *) wr->sg_list->addr;
+            ctx->sg_arr[j].total_sq_elems = 1;
+            ctx->sg_arr[j].mapped_sgs = (void *) IBV_WR_SEND_WITH_IMM;
+            ctx->sg_arr[j].wr_opcode = wr->opcode;
+            ctx->sg_arr[j].total_sq_size =sizeof(wr->opcode);
+            ctx->sg_arr[j].rcv_signalled = true;
         }
-        ctx->sg_arr[j].mapped_sgs = sg_ptr;
-        ctx->sg_arr[j].total_sq_elems++;
-        ctx->sg_arr[j].total_sq_size += wr->sg_list->length;
-        ftruncate(ctx->sg_arr[j].wr_shared_mem_fd,
-                    ctx->sg_arr[j].total_sq_size);
+        //#if 0
+        else
+        {
+            sg_ptr = mmap((uint64_t *)wr->sg_list->addr,
+                            wr->sg_list->length,
+                            PROT_READ|PROT_WRITE,
+                            MAP_SHARED,
+                            ctx->sg_arr[j].wr_shared_mem_fd, 0);
+        // todo make a list remmapped to shared mem
+            if (sg_ptr == MAP_FAILED) {
+                fprintf(stderr, "%s Failed to mmap SG \n", __func__ );
+                exit(-1);
+            }
+            ctx->sg_arr[j].wr_opcode = IBV_WC_RECV;
+            ctx->sg_arr[j].mapped_sgs = sg_ptr;
+            ctx->sg_arr[j].total_sq_elems++;
+            ctx->sg_arr[j].total_sq_size += wr->sg_list->length;
+        }
+        ftruncate(ctx->sg_arr[j].wr_shared_mem_fd, sizeof(ctx->sg_arr[j]));
         return 0;
     }
-    fprintf(stderr, "%s CAN NOT place WR into Peers rcv_wr, end of RCV_MAX=%d\n", 
-                     __func__, RCV_MAX);
+    //#endif
+    fprintf(stderr, "SEND CAN NOT place WR into Peers rcv_wr, end of RCV_MAX\n");
     return -1;
 }
 
 
-  
+
 typedef struct {
     struct ibv_context *context;
     int cqe;
@@ -472,7 +479,7 @@ typedef struct {
     completion_queue_t *tmp = malloc( sizeof(*tmp));
     tmp->comp_vector = comp_vector;
     tmp->channel = channel;
-    
+
     tmp->context = context;
     tmp->cqe = cqe;
 
@@ -484,7 +491,7 @@ typedef struct {
     cq->cqe = 0;
     return cq;
 }
-                            
+
 int  __attribute__((unused)) ibv_destroy_cq(struct ibv_cq *cq)
 {
    // completion_queue_t *tmp;
@@ -499,7 +506,8 @@ ibv_modify_qp(struct ibv_qp *qp,
                          struct ibv_qp_attr *attr,
                           int attr_mask)
 {
-    fprintf(stderr, "%s not implemented\n", __func__);
+    qp->state = IBV_QPS_RTS;
+    fprintf(stderr, "%s QP qp_num=%i Ready IBV_QPS_RTS\n", __func__, qp->qp_num);
     return 0;
 }
 /* I am willimg to receivev, place WR into remote peer send buf */
