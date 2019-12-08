@@ -75,9 +75,13 @@ struct ibv_context *ibv_open_device(struct ibv_device *device){
     int fd;
     
     fd = shm_open("ibverbs", O_RDONLY|O_CREAT|O_TRUNC, S_IRWXU);
+    if (fd <= 0) {
+           fprintf(stderr, "Failed shmem_rcv_cqe_mem_%u\n", j);
+           exit(-1);
+    }
     ftruncate (fd, sizeof(shmem_context_t));
     shmem_hdr = mmap(NULL, sizeof(shmem_context_t ), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (! shmem_hdr) {
+    if (!shmem_hdr) {
            fprintf(stderr, "%s :Failed create shmem ibverbs header\n", __func__);
            exit(-1);
     }
