@@ -40,6 +40,8 @@ typedef struct _per_wr {
     struct ibv_sge *sg;
     int wr_shared_mem_fd;
     size_t total_sq_size;
+    size_t total_sq_elems;
+    void * mapped_sgs;
     bool rcv_signalled; // Signalled in poll_cq that receie is completed,
 } sge_of_wr_t;
 
@@ -59,6 +61,7 @@ typedef struct _per_qp {
 
 /* we need to save MR  and WR  Dor this purpose we extend ibv_context */
 typedef struct __shmem_context {
+    int header__mem_fd;
     struct ibv_context context;
     struct ibv_mr mr_arr[MR_BUFFERS_MAX];  //my buffers which remote  - per connection 
     uint16_t mr_index;
@@ -74,16 +77,25 @@ shmem_context_t *shmem_hdr;  // Global header
 struct ibv_context *ibv_open_device(struct ibv_device *device){
     int fd;
     
-    fd = shm_open("rdma_verbs", O_RDONLY|O_CREAT, S_IRWXU);
+    fd = shm_open("ibverbs", O_RDONLY|O_CREAT|O_TRUNC, S_IRWXU);
     ftruncate (fd, sizeof(shmem_context_t));
-    shmem_hdr = mmap(NULL, sizeof(shmem_context_t ), PROT_READ|PROT_WRITE, MAP_FILE|MAP_SHARED, fd, 0);
-     // Create a smmen for snd/rcv sqe memmory
+    shmem_hdr = mmap(NULL, sizeof(shmem_context_t ), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    if (! shmem_hdr) {
+           fprintf(stderr, "%s :Failed create shmem ibverbs header\n", __func__);
+           exit(-1);
+    }
+    shmem_hdr->header__mem_fd = fd;
+     // Create a smmem for snd/rcv Scatter-Gather list 
     for ( uint16_t j= 0; j< RCV_MAX; j++){
         char * shname = NULL;
         int rc  = asprintf( &shname,  "shmem_rcv_cqe_mem_%u", j);
         assert (rc > 0);
-        fd = shm_open(shname, O_RDONLY|O_CREAT, S_IRWXU);
-        assert (fd > 0);
+        fd = shm_open(shname, O_RDONLY|O_CREAT|O_TRUNC, S_IRWXU);
+        if (fd <= 0) {
+           fprintf(stderr, "Failed shmem_rcv_cqe_mem_%u\n", j);
+           exit(-1);
+        }
+        ftruncate(fd, 0);
         shmem_hdr->sg_arr[j].wr_shared_mem_fd = fd;
         shmem_hdr->sg_arr[j].rcv_signalled = false;
         shmem_hdr->sg_arr[j].total_sq_size = 0;
@@ -96,8 +108,20 @@ struct ibv_context *ibv_open_device(struct ibv_device *device){
 
 int ibv_close_device(struct ibv_context *context){
     shmem_context_t * ctx = container_of(context, shmem_context_t,context );
+    for ( uint16_t j= 0; j< RCV_MAX; j++){
+        char * shname = NULL;
+        munmap(shmem_hdr->sg_arr[j].mapped_sgs, shmem_hdr->sg_arr[j].total_sq_size);
+        smm_unlink(shmem_hdr->sg_arr[j].wr_shared_mem_fd);
+        shmem_hdr->sg_arr[j].mapped_sgs = NULL;
+        shmem_hdr->sg_arr[j].wr_shared_mem_fd = 0;
+        shmem_hdr->sg_arr[j].rcv_signalled = false;
+        shmem_hdr->sg_arr[j].total_sq_size = 0;
+        shmem_hdr->sg_arr[j].total_sq_size = 0;
+        shmem_hdr->sg_arr[j].sg = NULL;
+    }
     free (context);
-    free(ctx);
+    munmap(ctx, sizeof(*ctx));
+    smm_unlink(ctx->header__mem_fd);
     return 0;
 }
 
@@ -238,13 +262,15 @@ int ibv_query_port(struct ibv_context *context, uint8_t port_num,
 
 /*
 * We need to create shared memory from addr and then notify peer of this addrees
+ibv_reg_mr()  registers  a  memory  region  (MR)  associated with the protection
+       domain pd.
 */
 struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr,
                                  size_t length, int access){
    int rc;
    struct ibv_mr *mr = NULL;
    shmem_context_t * ctx = container_of(pd->context, shmem_context_t, context);
-   /// Find qp
+   /// Find free slot, each PD thereticlly has its own list of memory regions
    
    for ( uint8_t i = 0; i< MR_BUFFERS_MAX; i++) {
        if ( ctx->mr_arr[i].addr == NULL) {
@@ -257,25 +283,26 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr,
             mr->handle= 0;
             //mr->type = IBV_MR_TYPE_MR;
             mr->pd = pd;
+            return mr;
        }
    }
-   return mr;
+   return NULL;
 }
 
  int ibv_dereg_mr(struct ibv_mr *mr){
     shmem_context_t * ctx = container_of(mr->pd->context, shmem_context_t, context );
 
     for ( uint8_t i = 0; i< MR_BUFFERS_MAX; i++) {
-            if ( ctx->mr_arr[i].rkey == mr->addr) {
+            if ( ctx->mr_arr[i].addr == mr->addr) {
                 ctx->mr_arr[i].addr = NULL;
                 mr->lkey = 0; // key of local memory reqion
                 mr->rkey = 0; // key of remote memory reqion
-           
                 mr->length = 0;
                 ctx->mr_index--;
+                return 0;
             }
     }
-    return 0;
+    return -1;
  }
 
  int ibv_query_device(struct ibv_context *context,
@@ -362,6 +389,7 @@ int ibv_poll_cq(struct ibv_cq *cq, int num_entries,
    }
    return -1;
 }
+
 /* So we mapped SG element to SHMEM 
  Q : should it be per QP ?
 */
@@ -371,25 +399,29 @@ int ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
     shmem_context_t * ctx = shmem_hdr;
    
     // Find free snd slot to place write request
+    // free slot is when completed Reception  from Peer is signalled
     for (uint16_t j=0; j < RCV_MAX; j++) {
         // ctx->rcv_wr, snd_wr must be in shared mem;
-        if (!ctx->sg_arr[j].rcv_signalled){
+        if (!ctx->sg_arr[j].rcv_signalled) {
             fprintf(stderr, "POST_RECV Shmem SQ %i not consumed\n", j);
             continue;
         }
-        // Put wr that contain sge list to shared mem;
-        // BU buffer is in appplication, so we remap iti ti shmem
+        // Store WR that contain sge wr_id and other fields;
         memcpy(&ctx->qp_arr[qp->qp_num].snd_wr[j] , wr, sizeof(*wr));
 
-        // Then mmap SQ data to shared mem
+        // Now  mmap SQ list addresses into shared mem
         
-        // Completed Reception  from Peer
+        // signalled == true, we can reuse 
         ftruncate(ctx->sg_arr[j].wr_shared_mem_fd, 0);
-        mmap(wr->sg_list->addr, wr->sg_list->length, PROT_READ|PROT_WRITE,MAP_SHARED, 
+        mmap(wr->sg_list->addr, wr->sg_list->length, PROT_READ|PROT_WRITE, MAP_SHARED,
+                ctx->sg_arr[j].wr_shared_mem_fd,
+                ctx->sg_arr[j].total_sq_size);
         // @todo make a list remmapped to shared mem
         ctx->sg_arr[j].wr_shared_mem_fd, 0);
-
-        ftruncate(ctx->sg_arr[j].wr_shared_mem_fd, wr->sg_list->length);
+        ctx->sg_arr[j].total_sq_elems++;
+        ctx->sg_arr[j].total_sq_size += wr->sg_list->length;
+        ftruncate(ctx->sg_arr[j].wr_shared_mem_fd,
+                    ctx->sg_arr[j].wr->sg_list->length);
         return 0;
     }
     fprintf(stderr, "%s CAN NOT place WR into Peers rcv_wr, end of RCV_MAX=%d\n", 
@@ -424,8 +456,8 @@ typedef struct {
     struct ibv_context *context;
     int cqe;
     struct ibv_cq *cq;
-     void *cq_context;
-     struct ibv_comp_channel *channel;
+    void *cq_context;
+    struct ibv_comp_channel *channel;
     int comp_vector;
 }  completion_queue_t;
 struct ibv_cq *ibv_create_cq(struct ibv_context *context, int cqe,
