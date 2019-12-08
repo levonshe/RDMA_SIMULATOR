@@ -91,10 +91,12 @@ struct ibv_context *ibv_open_device(struct ibv_device *device){
         int rc  = asprintf( &shname,  "shmem_rcv_cqe_mem_%u", j);
         assert (rc > 0);
         fd = shm_open(shname, O_RDONLY|O_CREAT|O_TRUNC, S_IRWXU);
+        free(shname);
         if (fd <= 0) {
            fprintf(stderr, "Failed shmem_rcv_cqe_mem_%u\n", j);
            exit(-1);
         }
+        
         ftruncate(fd, 0);
         shmem_hdr->sg_arr[j].wr_shared_mem_fd = fd;
         shmem_hdr->sg_arr[j].rcv_signalled = false;
@@ -110,7 +112,11 @@ int ibv_close_device(struct ibv_context *context){
     shmem_context_t * ctx = container_of(context, shmem_context_t,context );
     for ( uint16_t j= 0; j< RCV_MAX; j++){
         munmap(shmem_hdr->sg_arr[j].mapped_sgs, shmem_hdr->sg_arr[j].total_sq_size);
-        shm_unlink(shmem_hdr->sg_arr[j].wr_shared_mem_fd);
+        char * shname = NULL;
+        int rc  = asprintf( &shname,  "shmem_rcv_cqe_mem_%u", j);
+        assert (rc > 0);
+        shm_unlink(shname);
+        free(shname);
         shmem_hdr->sg_arr[j].mapped_sgs = NULL;
         shmem_hdr->sg_arr[j].wr_shared_mem_fd = 0;
         shmem_hdr->sg_arr[j].rcv_signalled = false;
@@ -120,7 +126,7 @@ int ibv_close_device(struct ibv_context *context){
     }
     free (context);
     munmap(ctx, sizeof(*ctx));
-    smm_unlink(ctx->header__mem_fd);
+    shm_unlink("ibverbs");
     return 0;
 }
 
@@ -396,6 +402,13 @@ int ibv_poll_cq(struct ibv_cq *cq, int num_entries,
 int ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
 				struct ibv_recv_wr **bad_wr)
 {
+    // jusr preparing to send
+    return 0;
+}
+/* I am willimg to send, place WR into remote peer rcv buf */ 
+int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
+				struct ibv_send_wr **bad_wr) 
+{
     shmem_context_t * ctx = shmem_hdr;
     void *ptr;
     // Find free snd slot to place write request
@@ -413,20 +426,20 @@ int ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
         
         // signalled == true, we can reuse 
         ftruncate(ctx->sg_arr[j].wr_shared_mem_fd, 0);
-        ptr = mmap((uintptr_t)wr->sg_list->addr, wr->sg_list->length, PROT_READ|PROT_WRITE, MAP_SHARED,
+        ptr = mmap((uint64_t *)wr->sg_list->addr, wr->sg_list->length, PROT_READ|PROT_WRITE, MAP_SHARED,
                 ctx->sg_arr[j].wr_shared_mem_fd,
                 ctx->sg_arr[j].total_sq_size);
         // @todo make a list remmapped to shared mem
         if (ptr == NULL) {
-             fprintf(stderr, "%s Failed to mmap SG \n", __FUNC__ );
-
+             fprintf(stderr, "%s Failed to mmap SG \n", __func__ );
             exit(-1);
         }
+        
         ctx->sg_arr[j].mapped_sgs = ptr;
         ctx->sg_arr[j].total_sq_elems++;
         ctx->sg_arr[j].total_sq_size += wr->sg_list->length;
         ftruncate(ctx->sg_arr[j].wr_shared_mem_fd,
-                    ctx->sg_arr[j].wr->sg_list->length);
+                    ctx->sg_arr[j].total_sq_size);
         return 0;
     }
     fprintf(stderr, "%s CAN NOT place WR into Peers rcv_wr, end of RCV_MAX=%d\n", 
@@ -434,28 +447,7 @@ int ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
     return -1;
 }
 
-/* I am willimg to send, place WR into remote peer rcv buf */ 
-int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
-				struct ibv_send_wr **bad_wr)
-{
-    shmem_context_t * ctx = container_of(qp->context, shmem_context_t, context);
-    for (uint16_t i = 0; i< QP_MAX; i++){
-        // Find QP
-         if (&ctx->qp_arr[i].qp == qp) {
-            for (uint16_t j = 0; j< RCV_MAX; j++){
-                // ctx->rcv_wr, snd_wr must be in shared mem;
-                if (ctx->qp_arr[i].rcv_wr[j] == NULL) {
-                    ctx->qp_arr[i].rcv_wr[j] = wr;
-                    ctx->qp_arr[i].rcv_wr_sg[j] = wr->sg_list
-                    return 0;
-                }
-                fprintf(stderr, "%s CAN NOT place WR into rcv_wr to end of RCV_MAX=%d\n", __FUNC__, RCV_MAX);
-                return -1;
-            }
-    }
-    fprintf(stderr, "%s CAN NOT find QP in QP ARR=%d\n", __FUNC__, QP_MAX);
-    return -1;
-}
+
   
 typedef struct {
     struct ibv_context *context;
@@ -493,9 +485,9 @@ int ibv_destroy_cq(struct ibv_cq *cq){
     return 0;
 }
 
-
-int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
-                         int attr_mask){
+int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr, int attr_mask)
+{
+    fprintf(stderr, "%s not implemented\n", __func__);
     return 0;
 }
 /* I am willimg to receivev, place WR into remote peer send buf */
