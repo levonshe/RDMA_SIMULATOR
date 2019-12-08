@@ -1,9 +1,9 @@
 CC=gcc
-CFLAGS=-Wall -Werror -g
+CFLAGS=-Wall -Werror -g -DDEBUG
 INCLUDES=
 LDFLAGS=
-#LIBS=-pthread -lrdmacm
-LIBS=-pthread
+#LIBS=-pthread -lrt -lrdmacm
+LIBS=-pthread -lrt
 
 SRCS=main.c client.c config.c ib.c server.c setup_ib.c sock.c libivb.c
 OBJS=$(SRCS:.c=.o)
@@ -12,7 +12,7 @@ PROG=rdma-tutorial
 all: $(PROG)
 
 debug: CFLAGS=-Wall -Werror -g -DDEBUG
-debug: $(PROG)
+debug: $(PROG) $(OBJS)
 
 .c.o:
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<

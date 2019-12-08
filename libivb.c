@@ -1,5 +1,4 @@
 #define _GNU_SOURCE
-#define DEBUG
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -51,12 +50,8 @@ typedef struct _per_qp {
     struct ibv_pd pd;
     int qp_shared_mem_fd;
     struct ibv_qp *remote_qp; // peer QP
-    //sge_of_wr_t snd_sge_[RCV_MAX];
-    //sge_of_wr_t rcv_sge_[RCV_MAX];
-    struct ibv_send_wr snd_wr[RCV_MAX]; // my wrire requests 
-    struct ibv_recv_wr rcv_wr[RCV_MAX];  // // Received  from Peer 
-    struct ibv_recv_wr * remote_rcv_wr[RCV_MAX];
-    struct ibv_send_wr * remote_snd_wr[RCV_MAX]; 
+    
+    
 } per_qp_t;
 
 /* we need to save MR  and WR  Dor this purpose we extend ibv_context */
@@ -69,8 +64,10 @@ typedef struct __shmem_context {
     uint32_t snd_index;
     uint32_t rcv_index;
     per_qp_t qp_arr[QP_MAX];
-    struct ibv_pd pd_arr[QP_MAX];
+    struct ibv_pd pd_arr[PD_MAX];
     sge_of_wr_t sg_arr[RCV_MAX];
+    struct ibv_send_wr snd_wr[RCV_MAX]; // my wrire requests 
+    struct ibv_recv_wr rcv_wr[RCV_MAX];  // // Received  from Peer 
      
 } shmem_context_t;
 shmem_context_t *shmem_hdr;  // Global header
@@ -294,7 +291,7 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr,
    return NULL;
 }
 
- int ibv_dereg_mr(struct ibv_mr *mr){
+ int  __attribute__((unused))ibv_dereg_mr(struct ibv_mr *mr){
     shmem_context_t * ctx = container_of(mr->pd->context, shmem_context_t, context );
 
     for ( uint8_t i = 0; i< MR_BUFFERS_MAX; i++) {
@@ -310,7 +307,7 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr,
     return -1;
  }
 
- int ibv_query_device(struct ibv_context *context,
+ int  __attribute__((unused))ibv_query_device(struct ibv_context *context,
                             struct ibv_device_attr *device_attr)
 {
     memset(device_attr, 1, sizeof(*device_attr));
@@ -324,14 +321,14 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr,
     return 0;
 }
 
-int ibv_query_pkey(struct ibv_context *context, uint8_t port_num,
+int  __attribute__((unused)) ibv_query_pkey(struct ibv_context *context, uint8_t port_num,
                           int index, uint16_t *pkey)
 {
     *pkey=1;                              
     return 0;
 }
 
-int ibv_query_gid(struct ibv_context *context, uint8_t port_num,
+int  __attribute__((unused)) ibv_query_gid(struct ibv_context *context, uint8_t port_num,
                          int index, union ibv_gid *gid)
 {                            
     return 999;
@@ -340,8 +337,9 @@ int ibv_query_gid(struct ibv_context *context, uint8_t port_num,
  Remote WR are registered in the QP snd_wr element 
  Local WR are registered only in QP snd_local count */
 /* Returns only 1 element  for now */
-int ibv_poll_cq(struct ibv_cq *cq, int num_entries,
-                       struct ibv_wc *wc){
+int  __attribute__((unused)) ibv_poll_cq(struct ibv_cq *cq, int num_entries,
+                       struct ibv_wc *wc)
+{
    shmem_context_t * ctx = shmem_hdr;
    uint16_t n;
 
@@ -366,7 +364,8 @@ int ibv_poll_cq(struct ibv_cq *cq, int num_entries,
                         wc[n].src_qp = wc->qp_num;
                         wc[n].opcode = IBV_WC_RECV;
                         wc[n].status = IBV_WC_SUCCESS;
-                        wc[n].wr_id = ctx->qp_arr[k].snd_wr[i].wr_id;
+                        wc[n].wr_id = ctx->snd_wr[i].wr_id;
+                        wc[n].imm_data = ctx->snd_wr[i].imm_data;
                     }
                 }
             }
@@ -380,15 +379,16 @@ int ibv_poll_cq(struct ibv_cq *cq, int num_entries,
                     wc[n].src_qp = wc->qp_num;
                     wc[n].opcode = IBV_WC_SEND;
                     wc[n].status = IBV_WC_SUCCESS;
-                    wc[n].wr_id = ctx->qp_arr[wc->qp_num].snd_wr[i].wr_id;
-                    wc[n].imm_data = ctx->qp_arr[wc->qp_num].snd_wr[i].imm_data;
+                    wc[n].wr_id = ctx->snd_wr[i].wr_id;
+                    wc[n].imm_data = ctx->snd_wr[i].imm_data;
                     
                     ctx->sg_arr[i].rcv_signalled = true;
                     // ? wc->sl = 1;
                     // ? wc->slid = 1;
                     // ? wc->pkey_index = 1;
                // ctx->snd_wr[i] = NULL; 
-                return 1;
+                    return 1;
+                }
             }
             
         }
@@ -399,18 +399,18 @@ int ibv_poll_cq(struct ibv_cq *cq, int num_entries,
 /* So we mapped SG element to SHMEM 
  Q : should it be per QP ?
 */
-int ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
+int  __attribute__((unused)) ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
 				struct ibv_recv_wr **bad_wr)
 {
     // jusr preparing to send
     return 0;
 }
 /* I am willimg to send, place WR into remote peer rcv buf */ 
-int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
-				struct ibv_send_wr **bad_wr) 
+int  __attribute__((unused)) ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
+				struct ibv_send_wr **bad_wr)
 {
     shmem_context_t * ctx = shmem_hdr;
-    void *ptr;
+    char * sg_ptr;
     // Find free snd slot to place write request
     // free slot is when completed Reception  from Peer is signalled
     for (uint16_t j=0; j < RCV_MAX; j++) {
@@ -420,22 +420,24 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
             continue;
         }
         // Store WR that contain sge wr_id and other fields;
-        memcpy(&ctx->qp_arr[qp->qp_num].snd_wr[j] , wr, sizeof(*wr));
-
+        ctx->snd_wr[j].wr_id = wr->wr_id;
+        ctx->snd_wr[j].imm_data = wr->imm_data;
+        sg_ptr = NULL;
         // Now  mmap SQ list addresses into shared mem
         
         // signalled == true, we can reuse 
         ftruncate(ctx->sg_arr[j].wr_shared_mem_fd, 0);
-        ptr = mmap((uint64_t *)wr->sg_list->addr, wr->sg_list->length, PROT_READ|PROT_WRITE, MAP_SHARED,
+        sg_ptr = mmap((uint64_t *)wr->sg_list->addr, 
+                wr->sg_list->length,
+                PROT_READ|PROT_WRITE, MAP_SHARED,
                 ctx->sg_arr[j].wr_shared_mem_fd,
                 ctx->sg_arr[j].total_sq_size);
-        // @todo make a list remmapped to shared mem
-        if (ptr == NULL) {
+        // todo make a list remmapped to shared mem
+        if (sg_ptr == NULL) {
              fprintf(stderr, "%s Failed to mmap SG \n", __func__ );
             exit(-1);
         }
-        
-        ctx->sg_arr[j].mapped_sgs = ptr;
+        ctx->sg_arr[j].mapped_sgs = sg_ptr;
         ctx->sg_arr[j].total_sq_elems++;
         ctx->sg_arr[j].total_sq_size += wr->sg_list->length;
         ftruncate(ctx->sg_arr[j].wr_shared_mem_fd,
@@ -457,10 +459,11 @@ typedef struct {
     struct ibv_comp_channel *channel;
     int comp_vector;
 }  completion_queue_t;
-struct ibv_cq *ibv_create_cq(struct ibv_context *context, int cqe,
+ __attribute__((unused)) struct ibv_cq *  ibv_create_cq(struct ibv_context *context, int cqe,
                                     void *cq_context,
                                     struct ibv_comp_channel *channel,
-                                    int comp_vector){
+                                    int comp_vector)
+{
 
     completion_queue_t *tmp = malloc( sizeof(*tmp));
     tmp->comp_vector = comp_vector;
@@ -476,8 +479,10 @@ struct ibv_cq *ibv_create_cq(struct ibv_context *context, int cqe,
     cq->channel = channel;
     cq->cqe = 0;
     return cq;
-}                             
-int ibv_destroy_cq(struct ibv_cq *cq){
+}
+                            
+int  __attribute__((unused)) ibv_destroy_cq(struct ibv_cq *cq)
+{
    // completion_queue_t *tmp;
     // *todo tmp=container_of
     free(cq);
@@ -485,7 +490,10 @@ int ibv_destroy_cq(struct ibv_cq *cq){
     return 0;
 }
 
-int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr, int attr_mask)
+int  __attribute__((unused))
+ibv_modify_qp(struct ibv_qp *qp,
+                         struct ibv_qp_attr *attr,
+                          int attr_mask)
 {
     fprintf(stderr, "%s not implemented\n", __func__);
     return 0;
