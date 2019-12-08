@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#define DEBUG
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -7,9 +8,8 @@
 
 #include <sys/stat.h>        /* For mode constants */
 #include <fcntl.h>           /* For O_* constants */
-
-
 #include <stdbool.h>
+#include <assert.h>
 
 #include <infiniband/verbs.h>
 #define container_of(ptr, type, member) ({                      \
@@ -109,9 +109,8 @@ struct ibv_context *ibv_open_device(struct ibv_device *device){
 int ibv_close_device(struct ibv_context *context){
     shmem_context_t * ctx = container_of(context, shmem_context_t,context );
     for ( uint16_t j= 0; j< RCV_MAX; j++){
-        char * shname = NULL;
         munmap(shmem_hdr->sg_arr[j].mapped_sgs, shmem_hdr->sg_arr[j].total_sq_size);
-        smm_unlink(shmem_hdr->sg_arr[j].wr_shared_mem_fd);
+        shm_unlink(shmem_hdr->sg_arr[j].wr_shared_mem_fd);
         shmem_hdr->sg_arr[j].mapped_sgs = NULL;
         shmem_hdr->sg_arr[j].wr_shared_mem_fd = 0;
         shmem_hdr->sg_arr[j].rcv_signalled = false;
@@ -208,7 +207,7 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd,
             ctx->qp_index++;
             assert ( ctx->qp_index < QP_MAX);
             qp->qp_num = i;
-            ctx->qp_arr[i].remote_qp == NULL;
+            ctx->qp_arr[i].remote_qp = NULL;
             qp->state = IBV_QPS_RESET;
 		    qp->events_completed = 0;
 		    pthread_mutex_init(&qp->mutex, NULL);
@@ -267,7 +266,7 @@ ibv_reg_mr()  registers  a  memory  region  (MR)  associated with the protection
 */
 struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr,
                                  size_t length, int access){
-   int rc;
+  
    struct ibv_mr *mr = NULL;
    shmem_context_t * ctx = container_of(pd->context, shmem_context_t, context);
    /// Find free slot, each PD thereticlly has its own list of memory regions
@@ -371,12 +370,13 @@ int ibv_poll_cq(struct ibv_cq *cq, int num_entries,
                 off_t shmem_rcv_len = lseek( ctx->sg_arr[i].wr_shared_mem_fd, 0 , SEEK_CUR);
                 if ( shmem_rcv_len > 0) {
                     wc[n].qp_num = ctx->qp_arr[k].qp.qp_num;
+                    wc[n].vendor_err = 0;
                     wc[n].src_qp = wc->qp_num;
                     wc[n].opcode = IBV_WC_SEND;
                     wc[n].status = IBV_WC_SUCCESS;
                     wc[n].wr_id = ctx->qp_arr[wc->qp_num].snd_wr[i].wr_id;
-                    wc[n].imm_data = &ctx->qp_arr[wc->qp_num].snd_wr[i].imm_data;
-                    wc[n].vendor_err = 0;
+                    wc[n].imm_data = ctx->qp_arr[wc->qp_num].snd_wr[i].imm_data;
+                    
                     ctx->sg_arr[i].rcv_signalled = true;
                     // ? wc->sl = 1;
                     // ? wc->slid = 1;
@@ -397,7 +397,7 @@ int ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
 				struct ibv_recv_wr **bad_wr)
 {
     shmem_context_t * ctx = shmem_hdr;
-   
+    void *ptr;
     // Find free snd slot to place write request
     // free slot is when completed Reception  from Peer is signalled
     for (uint16_t j=0; j < RCV_MAX; j++) {
@@ -413,11 +413,16 @@ int ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
         
         // signalled == true, we can reuse 
         ftruncate(ctx->sg_arr[j].wr_shared_mem_fd, 0);
-        mmap(wr->sg_list->addr, wr->sg_list->length, PROT_READ|PROT_WRITE, MAP_SHARED,
+        ptr = mmap((uintptr_t)wr->sg_list->addr, wr->sg_list->length, PROT_READ|PROT_WRITE, MAP_SHARED,
                 ctx->sg_arr[j].wr_shared_mem_fd,
                 ctx->sg_arr[j].total_sq_size);
         // @todo make a list remmapped to shared mem
-        ctx->sg_arr[j].wr_shared_mem_fd, 0);
+        if (ptr == NULL) {
+             fprintf(stderr, "%s Failed to mmap SG \n", __FUNC__ );
+
+            exit(-1);
+        }
+        ctx->sg_arr[j].mapped_sgs = ptr;
         ctx->sg_arr[j].total_sq_elems++;
         ctx->sg_arr[j].total_sq_size += wr->sg_list->length;
         ftruncate(ctx->sg_arr[j].wr_shared_mem_fd,
