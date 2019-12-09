@@ -5,11 +5,30 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "RDMA",
+            "name": "Server",
             "type": "cppdbg",
             "request": "launch",
             "program": "/home/lev/RDMA-Tutorial/rdma-tutorial",
-            "args": [ "localhost", "8888"],
+            "args": ["8888"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "Client",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "/home/lev/RDMA-Tutorial/rdma-tutorial",
+            "args": [ "localhost","8888"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],

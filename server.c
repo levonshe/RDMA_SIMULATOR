@@ -92,7 +92,7 @@ void *server_thread (void *arg)
 		post_send (msg_size, lkey, 0, MSG_REGULAR, qp, msg_ptr);
 
 		/* post a new receive */
-                post_recv (msg_size, lkey, wc[i].wr_id, qp, msg_ptr);
+        post_recv (msg_size, lkey, wc[i].wr_id, qp, msg_ptr);
 	    }
 	}
     }

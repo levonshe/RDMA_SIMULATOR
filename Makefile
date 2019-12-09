@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-Wall -Werror -g3 -o0 -DDEBUG
+CFLAGS=-Wall -g3 -o0 -DDEBUG
 INCLUDES=
 LDFLAGS=
 #LIBS=-pthread -lrt -lrdmacm
@@ -11,7 +11,7 @@ PROG=rdma-tutorial
 
 all: $(PROG)
 
-debug: CFLAGS=-Wall -Werror -g -DDEBUG
+debug: CFLAGS=-Wall -g -DDEBUG
 debug: $(PROG) $(OBJS)
 
 .c.o:

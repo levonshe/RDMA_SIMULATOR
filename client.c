@@ -56,7 +56,8 @@ void *client_thread_func (void *arg)
     /* wait for start signal */
     while (start_sending != true) {
         do {
-         } while (n < 1);
+            n = ibv_poll_cq (cq, num_wc, wc);
+        } while (n < 1);
         check (n > 0, "thread[%ld]: failed to poll cq", thread_id);
 
         for (i = 0; i < n; i++) {
@@ -70,11 +71,11 @@ void *client_thread_func (void *arg)
 		buf_offset = (buf_offset + msg_size) % buf_size;
 		buf_ptr += buf_offset;
 
-                if (ntohl(wc[i].imm_data) == MSG_CTL_START) {
+        if (ntohl(wc[i].imm_data) == MSG_CTL_START) {
 		    start_sending = true;
 		    break;
-                }
             }
+        }
         }
     }
     log ("thread[%ld]: ready to send", thread_id);
@@ -90,8 +91,8 @@ void *client_thread_func (void *arg)
     
 
     while (stop != true) {    
-	/* poll cq */
-	n = ibv_poll_cq (cq, num_wc, wc);
+	    /* poll cq */
+	    n = ibv_poll_cq (cq, num_wc, wc);
         if (n < 0) {
             check (0, "thread[%ld]: Failed to poll cq", thread_id);
         }
