@@ -15,16 +15,20 @@
         const typeof( ((type *)0)->member ) *__mptr = (ptr);\
         (type *)( (char *)__mptr - offsetof(type,member) );})
 
+#define PAGE_SIZE 4096
 #ifdef DEBUG
-#define RCV_MAX 4
+    #define RCV_MAX 4
+    #define QP_MAX 2
+    #define CQ_MAX 3
+    #define MR_BUFFERS_MAX 2
+    #define PD_MAX 2
 #else
 #define RCV_MAX 250
-#endif
-#define PAGE_SIZE 4096
 #define QP_MAX 16
 #define PD_MAX 8
 #define CQ_MAX 16
 #define MR_BUFFERS_MAX 16
+#endif
 struct ibv_device **ibv_get_device_list(int *num_devices){
     if ( num_devices)
         *num_devices =1;
@@ -48,7 +52,7 @@ typedef struct _per_wr {
     size_t total_sq_size;
     size_t total_sq_elems;
     void * mapped_sgs;
-    bool   rcv_posted; // Signalled in poll_cq that receie is completed,
+    bool   sent_posted; // Signalled in poll_cq that receie is completed,
 } sent_wr_t;
 
 
@@ -66,7 +70,7 @@ typedef struct __shmem_context {
     uint16_t mr_count;
     per_qp_t qp_arr[QP_MAX];
     struct ibv_pd pd_arr[PD_MAX];
-    sent_wr_t sg_arr[RCV_MAX];
+    sent_wr_t sent_arr[RCV_MAX];
 } shmem_context_t;
 typedef struct _local_rcv {
     struct ibv_recv_wr * local_rcv_wr[RCV_MAX];
@@ -115,11 +119,11 @@ struct ibv_context *ibv_open_device(struct ibv_device *device){
         }
 
         ftruncate(fd, 0);
-        shmem_hdr->sg_arr[j].wr_shared_mem_fd = fd;
-        shmem_hdr->sg_arr[j].rcv_posted = false;
-        shmem_hdr->sg_arr[j].total_sq_size = 0;
-        shmem_hdr->sg_arr[j].sg = NULL;
-        shmem_hdr->sg_arr[j].mapped_sgs = NULL;
+        shmem_hdr->sent_arr[j].wr_shared_mem_fd = fd;
+        shmem_hdr->sent_arr[j].sent_posted = false;
+        shmem_hdr->sent_arr[j].total_sq_size = 0;
+        shmem_hdr->sent_arr[j].sg = NULL;
+        shmem_hdr->sent_arr[j].mapped_sgs = NULL;
     }
 
     //
@@ -129,18 +133,18 @@ struct ibv_context *ibv_open_device(struct ibv_device *device){
 int ibv_close_device(struct ibv_context *context){
     shmem_context_t * ctx = container_of(context, shmem_context_t,context );
     for ( uint16_t j= 0; j< RCV_MAX; j++){
-        munmap(shmem_hdr->sg_arr[j].mapped_sgs, shmem_hdr->sg_arr[j].total_sq_size);
+        munmap(shmem_hdr->sent_arr[j].mapped_sgs, shmem_hdr->sent_arr[j].total_sq_size);
         char * shname = NULL;
         int rc  = asprintf( &shname,  "shmem_rcv_cqe_mem_%u", j);
         assert (rc > 0);
         shm_unlink(shname);
         free(shname);
-        shmem_hdr->sg_arr[j].mapped_sgs = NULL;
-        shmem_hdr->sg_arr[j].wr_shared_mem_fd = 0;
-        shmem_hdr->sg_arr[j].rcv_posted = false;
-        shmem_hdr->sg_arr[j].total_sq_size = 0;
-        shmem_hdr->sg_arr[j].total_sq_size = 0;
-        shmem_hdr->sg_arr[j].sg = NULL;
+        shmem_hdr->sent_arr[j].mapped_sgs = NULL;
+        shmem_hdr->sent_arr[j].wr_shared_mem_fd = 0;
+        shmem_hdr->sent_arr[j].sent_posted = false;
+        shmem_hdr->sent_arr[j].total_sq_size = 0;
+        shmem_hdr->sent_arr[j].total_sq_size = 0;
+        shmem_hdr->sent_arr[j].sg = NULL;
     }
     free (context);
     munmap(ctx, sizeof(*ctx));
@@ -340,7 +344,7 @@ int  signal_local_rcv( int num_entries,
             found++;
             wc[i].qp_num = local_rcv.rcv_qp[i]->qp_num;
             wc[i].src_qp = local_rcv.rcv_qp[i]->qp_num;
-            wc[i].opcode = local_rcv.local_rcv_wr[i]->wr_id;
+            wc[i].opcode = IBV_WC_RECV;
             wc[i].status = IBV_WC_SUCCESS;
             wc[i].wr_id = local_rcv.local_rcv_wr[i]->wr_id;
             wc[i].slid = 9998;
@@ -368,32 +372,28 @@ int  __attribute__((unused)) ibv_poll_cq(struct ibv_cq *cq, int num_entries,
    // First, complete local rcv
    n = signal_local_rcv(num_entries, wc);
 
-   for (uint16_t k = 0; k< QP_MAX && (n < num_entries); k++){
-        for (; n < num_entries ;n++) {
-            for ( uint16_t i = 0; i< RCV_MAX && (n < num_entries); i++){
-                // So rcv side has access to data but how do i know when to release it?
-                // I will release after signalled=true
-                off_t shmem_rcv_len = lseek( ctx->sg_arr[i].wr_shared_mem_fd, 0 , SEEK_END);
-                if ( shmem_rcv_len > 0) {
-                    n++;
-                    wc[n].qp_num = ctx->sg_arr[i].src_qp.qp_num;
-                    wc[n].vendor_err = 0;
-                    wc[n].src_qp = wc->qp_num;
-                    wc[n].opcode = ctx->sg_arr[i].wr_opcode;
-                    wc[n].status = IBV_WC_SUCCESS;
-                    wc[n].wr_id = ctx->sg_arr[i].snd_wr.wr_id;
-                    wc[n].imm_data = ctx->sg_arr[i].snd_wr.imm_data;
+    for ( uint16_t i = 0; i< RCV_MAX && (n <= num_entries); i++){
+        // So rcv side has access to data but how do i know when to release it?
+        // I will release after signalled=true
+        
+        if ( ctx->sent_arr[i].sent_posted ) {
+            n++;
+            wc[n].qp_num = ctx->sent_arr[i].src_qp.qp_num;
+            wc[n].vendor_err = 0;
+            wc[n].src_qp = wc->qp_num;
+            wc[n].opcode = IBV_WC_SEND;
+            wc[n].status = IBV_WC_SUCCESS;
+            wc[n].wr_id = ctx->sent_arr[i].snd_wr.wr_id;
+            wc[n].imm_data = ctx->sent_arr[i].snd_wr.imm_data;
 
-                    ctx->sg_arr[i].rcv_posted = false; // release slot
-                    // ? wc->sl = 1;
-                    // ? wc->slid = 1;
-                    // ? wc->pkey_index = 1;
-               // ctx->snd_wr[i] = NULL
-                }
-            }
-
+            ctx->sent_arr[i].sent_posted = false; // release slot
+            // ? wc->sl = 1;
+            // ? wc->slid = 1;
+            // ? wc->pkey_index = 1;
+             // ctx->snd_wr[i] = NULL
         }
-   }
+    }
+   
    return n;
 }
 
@@ -428,22 +428,22 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
     for (uint16_t j=0; j < RCV_MAX; j++)
     {
         // Find free slot 
-        if ( ctx->sg_arr[j].mapped_sgs && (!ctx->sg_arr[j].rcv_posted)) {
+        if ( ctx->sent_arr[j].mapped_sgs && (!ctx->sent_arr[j].sent_posted)) {
             fprintf(stderr, "POST_RECV Shmem SQ %i not consumed\n", j);
             continue;
         }
         // Place WR in shared mem;
-        memcpy(&ctx->sg_arr[j].snd_wr, wr, sizeof(*wr));
+        memcpy(&ctx->sent_arr[j].snd_wr, wr, sizeof(*wr));
         
         sg_ptr = NULL;
 
         if ( wr->opcode == IBV_WR_SEND_WITH_IMM ) {
             sg_ptr = (void *) wr->sg_list->addr;
-            ctx->sg_arr[j].total_sq_elems = 1;
-            ctx->sg_arr[j].mapped_sgs = (void *) IBV_WR_SEND_WITH_IMM;
-            ctx->sg_arr[j].wr_opcode = wr->opcode;
-            ctx->sg_arr[j].total_sq_size =sizeof(wr->opcode);
-            ctx->sg_arr[j].rcv_posted = true;
+            ctx->sent_arr[j].total_sq_elems = 1;
+            ctx->sent_arr[j].mapped_sgs = (void *) IBV_WR_SEND_WITH_IMM;
+            ctx->sent_arr[j].wr_opcode = wr->opcode;
+            ctx->sent_arr[j].total_sq_size =sizeof(wr->opcode);
+            ctx->sent_arr[j].sent_posted = true;
         }
         else
         {
@@ -451,21 +451,26 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
                             wr->sg_list->length,
                             PROT_READ|PROT_WRITE,
                             MAP_SHARED,
-                            ctx->sg_arr[j].wr_shared_mem_fd, 0);
+                            ctx->sent_arr[j].wr_shared_mem_fd, 0);
         // todo make a list remmapped to shared mem
             if (sg_ptr == MAP_FAILED) {
                 fprintf(stderr, "%s Failed to mmap SG \n", __func__ );
                 exit(-1);
             }
-            ctx->sg_arr[j].wr_opcode = IBV_WC_RECV;
-            ctx->sg_arr[j].mapped_sgs = sg_ptr;
-            ctx->sg_arr[j].total_sq_elems++;
-            ctx->sg_arr[j].total_sq_size += wr->sg_list->length;
+            ctx->sent_arr[j].wr_opcode = IBV_WC_RECV;
+            ctx->sent_arr[j].mapped_sgs = sg_ptr;
+            ctx->sent_arr[j].total_sq_elems++;
+            ctx->sent_arr[j].total_sq_size += wr->sg_list->length;
         }
-        ftruncate(ctx->sg_arr[j].wr_shared_mem_fd, sizeof(ctx->sg_arr[j]));
-        return 0;
+        int rc = ftruncate(ctx->sent_arr[j].wr_shared_mem_fd, sizeof(ctx->sent_arr[j]));
+        if (rc < 0) {
+            fprintf(stderr, "%s Failed truncate shmem %i to size %lu \n", __func__, j,  sizeof(ctx->sent_arr[j] ));
+            perror("Failed truncate shmem send");
+            exit(-2);
+        }
+        return rc;
     }
-    
+
     fprintf(stderr, "SEND CAN NOT place WR into Peers rcv_wr, end of RCV_MAX\n");
     return -1;
 }
