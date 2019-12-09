@@ -40,22 +40,21 @@ void ibv_free_device_list(struct ibv_device **list){
     free( list);
 }
 typedef struct _per_wr {
-    enum ibv_wr_opcode wr_opcode;
+    struct ibv_send_wr snd_wr; // my wrire requests
+    enum   ibv_wr_opcode wr_opcode;
+    struct ibv_qp src_qp;
     struct ibv_sge *sg;
-    int wr_shared_mem_fd;
+    int    wr_shared_mem_fd;
     size_t total_sq_size;
     size_t total_sq_elems;
     void * mapped_sgs;
-    bool rcv_signalled; // Signalled in poll_cq that receie is completed,
-} sge_of_wr_t;
+    bool   rcv_posted; // Signalled in poll_cq that receie is completed,
+} sent_wr_t;
 
 
 typedef struct _per_qp {
     struct ibv_qp qp;
     struct ibv_pd pd;
-    int qp_shared_mem_fd;
-    struct ibv_qp *remote_qp; // peer QP
-
 
 } per_qp_t;
 
@@ -64,20 +63,24 @@ typedef struct __shmem_context {
     int header__mem_fd;
     struct ibv_context context;
     struct ibv_mr mr_arr[MR_BUFFERS_MAX];  //my buffers which remote  - per connection
-    uint16_t mr_index;
-    uint16_t qp_index;
-    uint32_t snd_index;
-    uint32_t rcv_index;
+    uint16_t mr_count;
     per_qp_t qp_arr[QP_MAX];
     struct ibv_pd pd_arr[PD_MAX];
-    sge_of_wr_t sg_arr[RCV_MAX];
-    struct ibv_send_wr snd_wr[RCV_MAX]; // my wrire requests
-    struct ibv_recv_wr rcv_wr[RCV_MAX];  // // Received  from Peer
-
+    sent_wr_t sg_arr[RCV_MAX];
 } shmem_context_t;
-shmem_context_t *shmem_hdr=NULL;  // Global header
+typedef struct _local_rcv {
+    struct ibv_recv_wr * local_rcv_wr[RCV_MAX];
+    bool local_rcv_posted[RCV_MAX];
+    struct ibv_qp *rcv_qp[RCV_MAX];
+    // @todo atomic count
+    int local_rcv_count;
+} local_rcv_t;
+shmem_context_t *shmem_hdr=NULL;  // Global header in shared mem
+local_rcv_t local_rcv;
 struct ibv_context *ibv_open_device(struct ibv_device *device){
     int fd;
+
+    memset(&local_rcv, 0, sizeof(local_rcv));
 
     fd = shm_open("ibverbs", O_RDWR|O_CREAT, S_IRUSR|S_IWUSR|S_IWGRP|S_IRGRP);
     if (fd <= 0) {
@@ -113,7 +116,7 @@ struct ibv_context *ibv_open_device(struct ibv_device *device){
 
         ftruncate(fd, 0);
         shmem_hdr->sg_arr[j].wr_shared_mem_fd = fd;
-        shmem_hdr->sg_arr[j].rcv_signalled = false;
+        shmem_hdr->sg_arr[j].rcv_posted = false;
         shmem_hdr->sg_arr[j].total_sq_size = 0;
         shmem_hdr->sg_arr[j].sg = NULL;
         shmem_hdr->sg_arr[j].mapped_sgs = NULL;
@@ -134,7 +137,7 @@ int ibv_close_device(struct ibv_context *context){
         free(shname);
         shmem_hdr->sg_arr[j].mapped_sgs = NULL;
         shmem_hdr->sg_arr[j].wr_shared_mem_fd = 0;
-        shmem_hdr->sg_arr[j].rcv_signalled = false;
+        shmem_hdr->sg_arr[j].rcv_posted = false;
         shmem_hdr->sg_arr[j].total_sq_size = 0;
         shmem_hdr->sg_arr[j].total_sq_size = 0;
         shmem_hdr->sg_arr[j].sg = NULL;
@@ -240,17 +243,11 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd,
 int ibv_destroy_qp(struct ibv_qp *qp) {
     shmem_context_t * ctx = container_of(qp->context, shmem_context_t, context);
     for ( uint8_t i = 0; i< QP_MAX; i++){
-        if ( ctx->qp_arr[i].qp.qp_num == qp->qp_num) {
+        if ( ctx->qp_arr[i].qp.qp_num == qp->qp_num) 
             ctx->qp_arr[i].qp.qp_num = 0;
-            ctx->qp_index--;
-            ctx->qp_arr[i].remote_qp->qp_num = 0;
-            ctx->qp_arr[i].remote_qp = NULL;
-            ctx->qp_index--;
-        }
     }
     return 0;
 }
-
 
 int ibv_query_port(struct ibv_context *context, uint8_t port_num,
                         struct ibv_port_attr *port_attr){
@@ -276,7 +273,7 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr,
    for ( uint8_t i = 0; i< MR_BUFFERS_MAX; i++) {
        if ( ctx->mr_arr[i].addr == NULL) {
             mr = &ctx->mr_arr[i];
-            ctx->mr_index++;
+            ctx->mr_count++;
             mr->lkey = i + 1; // key of local memory reqion
             mr->rkey = i + 1; // key of remote memory reqion
             mr->addr = addr;
@@ -299,7 +296,7 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr,
                 mr->lkey = 0; // key of local memory reqion
                 mr->rkey = 0; // key of remote memory reqion
                 mr->length = 0;
-                ctx->mr_index--;
+                ctx->mr_count--;
                 return 0;
             }
     }
@@ -332,6 +329,30 @@ int  __attribute__((unused)) ibv_query_gid(struct ibv_context *context, uint8_t 
 {
     return 999;
 }
+int  signal_local_rcv( int num_entries,
+                       struct ibv_wc *wc)
+{
+    int found =0;
+   
+    for ( uint16_t i = 0; i< RCV_MAX && (found < num_entries); i++){
+        // @todo mutex
+        if ( local_rcv.local_rcv_posted[i] ) {
+            found++;
+            wc[i].qp_num = local_rcv.rcv_qp[i]->qp_num;
+            wc[i].src_qp = local_rcv.rcv_qp[i]->qp_num;
+            wc[i].opcode = local_rcv.local_rcv_wr[i]->wr_id;
+            wc[i].status = IBV_WC_SUCCESS;
+            wc[i].wr_id = local_rcv.local_rcv_wr[i]->wr_id;
+            wc[i].slid = 9998;
+            wc[i].sl = 13;
+            //wc[i].imm_data = 0;
+            //wc[i].imm_data = local_rcv.local_rcv_wr[i]->imm_data;
+            wc->vendor_err = 0;
+            local_rcv.local_rcv_posted[i] = false; // release posted slot i 
+        }
+    }
+    return found;
+}
 /*
  Remote WR are registered in the QP snd_wr element
  Local WR are registered only in QP snd_local count */
@@ -341,58 +362,39 @@ int  __attribute__((unused)) ibv_poll_cq(struct ibv_cq *cq, int num_entries,
 {
    shmem_context_t * ctx = shmem_hdr;
    uint16_t n;
-   uint16_t found = 0;
 
    assert(num_entries <64*1024);
-   //uint16_t qp_num;
-   // Scan all QP
-  // struct ibv_qp * qp;
-   for (uint16_t k = 0; k< QP_MAX; k++){
-    // Local snd_wr are sent immediately, i.e mapped to shmem_rcv_X
-    for (n =0; n < num_entries ;n++) {
-        for ( uint16_t i = 0; i< RCV_MAX && (n < num_entries); i++){
-            off_t shmem_rcv_len = lseek( ctx->sg_arr[i].wr_shared_mem_fd, 0 , SEEK_END);
-            if ( shmem_rcv_len > 0) {
-                found++;
-                wc[n].qp_num = ctx->qp_arr[k].qp.qp_num;
-                wc[n].src_qp = wc->qp_num;
-                wc[n].opcode = ctx->sg_arr[i].wr_opcode;
-                wc[n].status = IBV_WC_SUCCESS;
-                wc[n].wr_id = ctx->snd_wr[i].wr_id;
-                wc[n].imm_data = ctx->snd_wr[i].imm_data;
-                ctx->sg_arr[i].rcv_signalled = true;
-            }
-        }
-    }
-    }
-    for (uint16_t k = 0; k< QP_MAX; k++){
+
+   // First, complete local rcv
+   n = signal_local_rcv(num_entries, wc);
+
+   for (uint16_t k = 0; k< QP_MAX && (n < num_entries); k++){
         for (; n < num_entries ;n++) {
             for ( uint16_t i = 0; i< RCV_MAX && (n < num_entries); i++){
                 // So rcv side has access to data but how do i know when to release it?
                 // I will release after signalled=true
                 off_t shmem_rcv_len = lseek( ctx->sg_arr[i].wr_shared_mem_fd, 0 , SEEK_END);
                 if ( shmem_rcv_len > 0) {
-                    found++;
-                    wc[n].qp_num = ctx->qp_arr[k].qp.qp_num;
+                    n++;
+                    wc[n].qp_num = ctx->sg_arr[i].src_qp.qp_num;
                     wc[n].vendor_err = 0;
                     wc[n].src_qp = wc->qp_num;
                     wc[n].opcode = ctx->sg_arr[i].wr_opcode;
                     wc[n].status = IBV_WC_SUCCESS;
-                    wc[n].wr_id = ctx->snd_wr[i].wr_id;
-                    wc[n].imm_data = ctx->snd_wr[i].imm_data;
+                    wc[n].wr_id = ctx->sg_arr[i].snd_wr.wr_id;
+                    wc[n].imm_data = ctx->sg_arr[i].snd_wr.imm_data;
 
-                    ctx->sg_arr[i].rcv_signalled = true;
+                    ctx->sg_arr[i].rcv_posted = false; // release slot
                     // ? wc->sl = 1;
                     // ? wc->slid = 1;
                     // ? wc->pkey_index = 1;
-               // ctx->snd_wr[i] = NULL;
-                    return n;
+               // ctx->snd_wr[i] = NULL
                 }
             }
 
         }
    }
-   return -1;
+   return n;
 }
 
 /* So we mapped SG element to SHMEM
@@ -402,7 +404,16 @@ int  __attribute__((unused)) ibv_poll_cq(struct ibv_cq *cq, int num_entries,
 				struct ibv_recv_wr **bad_wr)
 {
     // just preparing to send
-    return 0;
+    for ( uint16_t i =0; i< RCV_MAX; i++){
+        if (local_rcv.local_rcv_posted[i] == false) {
+            local_rcv.local_rcv_posted[i] = true;
+            local_rcv.local_rcv_wr[i] = wr;
+            local_rcv.rcv_qp[i] = qp;
+            local_rcv.local_rcv_count++;
+            return 0;
+        }
+    }
+    return -1;
 }
 /*
  I am willing to send, place WR into remote peer rcv buf 
@@ -416,14 +427,14 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
     // free slot is when completed Reception  from Peer is signalled
     for (uint16_t j=0; j < RCV_MAX; j++)
     {
-        // ctx->rcv_wr, snd_wr must be in shared mem;
-        if ( ctx->sg_arr[j].mapped_sgs && (!ctx->sg_arr[j].rcv_signalled)) {
+        // Find free slot 
+        if ( ctx->sg_arr[j].mapped_sgs && (!ctx->sg_arr[j].rcv_posted)) {
             fprintf(stderr, "POST_RECV Shmem SQ %i not consumed\n", j);
             continue;
         }
-        // Store WR that contain sge wr_id and other fields;
-        ctx->snd_wr[j].wr_id = wr->wr_id;
-        ctx->snd_wr[j].imm_data = wr->imm_data;
+        // Place WR in shared mem;
+        memcpy(&ctx->sg_arr[j].snd_wr, wr, sizeof(*wr));
+        
         sg_ptr = NULL;
 
         if ( wr->opcode == IBV_WR_SEND_WITH_IMM ) {
@@ -432,9 +443,8 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
             ctx->sg_arr[j].mapped_sgs = (void *) IBV_WR_SEND_WITH_IMM;
             ctx->sg_arr[j].wr_opcode = wr->opcode;
             ctx->sg_arr[j].total_sq_size =sizeof(wr->opcode);
-            ctx->sg_arr[j].rcv_signalled = true;
+            ctx->sg_arr[j].rcv_posted = true;
         }
-        //#if 0
         else
         {
             sg_ptr = mmap((uint64_t *)wr->sg_list->addr,
@@ -455,7 +465,7 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
         ftruncate(ctx->sg_arr[j].wr_shared_mem_fd, sizeof(ctx->sg_arr[j]));
         return 0;
     }
-    //#endif
+    
     fprintf(stderr, "SEND CAN NOT place WR into Peers rcv_wr, end of RCV_MAX\n");
     return -1;
 }
