@@ -1,5 +1,8 @@
 #define _GNU_SOURCE
 #include <stdlib.h>
+#include <sys/types.h>
+#include <sys/syscall.h>
+#include <pthread.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <stdlib.h>
@@ -17,7 +20,7 @@
 
 #define PAGE_SIZE 4096
 #ifdef DEBUG
-    #define RCV_MAX 4
+    #define RCV_MAX 20
     #define QP_MAX 2
     #define CQ_MAX 3
     #define MR_BUFFERS_MAX 2
@@ -52,6 +55,7 @@ typedef struct _per_wr {
     size_t total_sq_size;
     size_t total_sq_elems;
     void * mapped_sgs;
+    pid_t  cq_context;
     bool   sent_posted; // Signalled in poll_cq that receie is completed,
 } sent_wr_t;
 
@@ -64,7 +68,7 @@ typedef struct _per_qp {
 
 /* we need to save MR  and WR  Dor this purpose we extend ibv_context */
 typedef struct __shmem_context {
-    int header__mem_fd;
+    int shared__mem_fd;
     struct ibv_context context;
     struct ibv_mr mr_arr[MR_BUFFERS_MAX];  //my buffers which remote  - per connection
     uint16_t mr_count;
@@ -104,7 +108,7 @@ struct ibv_context *ibv_open_device(struct ibv_device *device){
            exit(-1);
     }
     memset(shmem_hdr, 0, sizeof(shmem_context_t));
-    shmem_hdr->header__mem_fd = fd;
+    shmem_hdr->shared__mem_fd = fd;
 
      // Create a smmem for snd/rcv Scatter-Gather list
     for ( uint16_t j= 0; j< RCV_MAX; j++){
@@ -118,12 +122,13 @@ struct ibv_context *ibv_open_device(struct ibv_device *device){
            exit(-1);
         }
 
-        ftruncate(fd, 0);
+        memset(shmem_hdr, 0, sizeof(*shmem_hdr));
         shmem_hdr->sent_arr[j].wr_shared_mem_fd = fd;
         shmem_hdr->sent_arr[j].sent_posted = false;
         shmem_hdr->sent_arr[j].total_sq_size = 0;
         shmem_hdr->sent_arr[j].sg = NULL;
         shmem_hdr->sent_arr[j].mapped_sgs = NULL;
+        ftruncate(fd, sizeof(*shmem_hdr));
     }
 
     //
@@ -203,10 +208,11 @@ int ibv_get_cq_event(struct ibv_comp_channel *channel,
 		     struct ibv_cq **cq, void **cq_context)
 {
     struct ibv_cq *c= malloc(sizeof(struct ibv_cq));
-    c->cq_context = channel->context;
-    c->comp_events_completed = 1;
+    c->cq_context = (void *) (uintptr_t )getpid();
+    fprintf(stderr, " Created CQ contexts ans Channel%d\n",getpid());
+    c->comp_events_completed = 0;
     *cq=c;
-    *cq_context=c->cq_context;
+    *cq_context = (void *) (uintptr_t )getpid();
     return 0;
 
 }
@@ -231,8 +237,12 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd,
     for (  i = 0; i< QP_MAX; i++){
         if ( ctx->qp_arr[i].qp.qp_num == 0) {
             qp = &ctx->qp_arr[i].qp;
+            qp->context = pd->context;
+            qp->qp_context = pd->context; 
+            // ?? qp->srq
             qp->pd = pd;
-            qp->qp_num = i;
+            qp->qp_num = syscall(SYS_gettid);
+            fprintf(stderr, " Created QP %d\n",qp->qp_num);
             qp->state = IBV_QPS_RTS;
 		    qp->events_completed = 0;
 		    pthread_mutex_init(&qp->mutex, NULL);
@@ -327,8 +337,7 @@ int  __attribute__((unused)) ibv_query_pkey(struct ibv_context *context, uint8_t
     *pkey=1;
     return 0;
 }
-
-int  __attribute__((unused)) ibv_query_gid(struct ibv_context *context, uint8_t port_num,
+int get_gid(struct ibv_context *context, uint8_t port_num,
                          int index, union ibv_gid *gid)
 {
     return 999;
@@ -343,7 +352,7 @@ int  signal_local_rcv( int num_entries,
         if ( local_rcv.local_rcv_posted[i] ) {
             found++;
             wc[i].qp_num = local_rcv.rcv_qp[i]->qp_num;
-            wc[i].src_qp = local_rcv.rcv_qp[i]->qp_num;
+            wc[i].src_qp = syscall(SYS_gettid);
             wc[i].opcode = IBV_WC_RECV;
             wc[i].status = IBV_WC_SUCCESS;
             wc[i].wr_id = local_rcv.local_rcv_wr[i]->wr_id;
@@ -375,8 +384,9 @@ int  __attribute__((unused)) ibv_poll_cq(struct ibv_cq *cq, int num_entries,
     for ( uint16_t i = 0; i< RCV_MAX && (n <= num_entries); i++){
         // So rcv side has access to data but how do i know when to release it?
         // I will release after signalled=true
-        
-        if ( ctx->sent_arr[i].sent_posted ) {
+        // we can release only Peer wr, different context
+        if ( ctx->sent_arr[i].sent_posted &&
+            (ctx->sent_arr[i].cq_context != getpid()) ) {
             n++;
             wc[n].qp_num = ctx->sent_arr[i].src_qp.qp_num;
             wc[n].vendor_err = 0;
@@ -387,6 +397,20 @@ int  __attribute__((unused)) ibv_poll_cq(struct ibv_cq *cq, int num_entries,
             wc[n].imm_data = ctx->sent_arr[i].snd_wr.imm_data;
 
             ctx->sent_arr[i].sent_posted = false; // release slot
+           
+            fprintf(stderr, "PID [%d]/CQ Context %d Completer Shmem Slot %i of SRC_QP [%d] released\n", 
+                        getpid(), (int)(uintptr_t) ctx->sent_arr[i].cq_context, i, wc->qp_num);
+             
+            //fsync(ctx->shared__mem_fd);
+            #if 0
+            int rc = ftruncate(ctx->shared__mem_fd, sizeof(*ctx));
+            if (rc < 0) {
+                    fprintf(stderr, "%s Failed truncate shmem %i to size %lu \n", __func__, i,
+                    sizeof((*ctx)));
+                    perror("Failed truncate shmem send");
+                    exit(-2);
+            }
+            #endif
             // ? wc->sl = 1;
             // ? wc->slid = 1;
             // ? wc->pkey_index = 1;
@@ -423,17 +447,22 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
 {
     shmem_context_t * ctx = shmem_hdr;
     char * sg_ptr;
+    bool found_free_slot = false;
     // Find free snd slot to place write request
     // free slot is when completed Reception  from Peer is signalled
     for (uint16_t j=0; j < RCV_MAX; j++)
     {
         // Find free slot 
         if ( ctx->sent_arr[j].mapped_sgs && (!ctx->sent_arr[j].sent_posted)) {
-            fprintf(stderr, "POST_RECV Shmem SQ %i not consumed\n", j);
+           // fprintf(stderr, "POST_SENT Shmem SQ %i not consumed\n", j);
             continue;
         }
+        pthread_mutex_lock(&qp->mutex);
+        found_free_slot = true;
         // Place WR in shared mem;
+        memcpy(&ctx->sent_arr[j].src_qp, qp, sizeof(*qp));
         memcpy(&ctx->sent_arr[j].snd_wr, wr, sizeof(*wr));
+        ctx->sent_arr[j].cq_context = getpid();
         
         sg_ptr = NULL;
 
@@ -443,7 +472,7 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
             ctx->sent_arr[j].mapped_sgs = (void *) IBV_WR_SEND_WITH_IMM;
             ctx->sent_arr[j].wr_opcode = wr->opcode;
             ctx->sent_arr[j].total_sq_size =sizeof(wr->opcode);
-            ctx->sent_arr[j].sent_posted = true;
+            
         }
         else
         {
@@ -457,20 +486,31 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
                 fprintf(stderr, "%s Failed to mmap SG \n", __func__ );
                 exit(-1);
             }
+           
             ctx->sent_arr[j].wr_opcode = IBV_WC_RECV;
             ctx->sent_arr[j].mapped_sgs = sg_ptr;
             ctx->sent_arr[j].total_sq_elems++;
             ctx->sent_arr[j].total_sq_size += wr->sg_list->length;
         }
-        int rc = ftruncate(ctx->sent_arr[j].wr_shared_mem_fd, sizeof(ctx->sent_arr[j]));
+        ctx->sent_arr[j].sent_posted = true;
+        pthread_mutex_unlock(&qp->mutex);
+        fprintf(stderr, "PID[%d] POST Taking slot %u for QP=%d\n", getpid(), j,qp->qp_num );
+        //fsync(ctx->shared__mem_fd);
+        #if 0
+        int rc = ftruncate(ctx->shared__mem_fd, sizeof(*ctx));
         if (rc < 0) {
             fprintf(stderr, "%s Failed truncate shmem %i to size %lu \n", __func__, j,  sizeof(ctx->sent_arr[j] ));
             perror("Failed truncate shmem send");
             exit(-2);
         }
-        return rc;
+        #endif
+        return 0;
+       
     }
-
+    if ( !found_free_slot) {
+         fprintf(stderr, "POST_SENT Shmem SQ not consumed, no free slots\n");
+         exit(-4);
+    }
     fprintf(stderr, "SEND CAN NOT place WR into Peers rcv_wr, end of RCV_MAX\n");
     return -1;
 }
