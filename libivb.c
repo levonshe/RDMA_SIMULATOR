@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <stdlib.h>
 #include <malloc.h>
+#include <linux/membarrier.h>
 
 #include <sys/stat.h>        /* For mode constants */
 #include <fcntl.h>           /* For O_* constants */
@@ -373,14 +374,14 @@ int  signal_local_rcv( int num_entries,
 int  __attribute__((unused)) ibv_poll_cq(struct ibv_cq *cq, int num_entries,
                        struct ibv_wc *wc)
 {
-   shmem_context_t * ctx = shmem_hdr;
-   uint16_t n;
+    shmem_context_t * ctx = shmem_hdr;
+    uint16_t n;
 
-   assert(num_entries <64*1024);
+    assert(num_entries <64*1024);
 
-   // First, complete local rcv
-   n = signal_local_rcv(num_entries, wc);
-
+    // First, complete local rcv
+    n = signal_local_rcv(num_entries, wc);
+    syscall(SYS_membarrier, MEMBARRIER_CMD_SHARED, 0);
     for ( uint16_t i = 0; i< RCV_MAX && (n <= num_entries); i++){
         // So rcv side has access to data but how do i know when to release it?
         // I will release after signalled=true
