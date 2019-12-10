@@ -242,7 +242,7 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd,
             qp->qp_context = pd->context; 
             // ?? qp->srq
             qp->pd = pd;
-            qp->qp_num = syscall(SYS_gettid);
+            qp->qp_num = getpid();
             fprintf(stderr, " Created QP %d\n",qp->qp_num);
             qp->state = IBV_QPS_RTS;
 		    qp->events_completed = 0;
@@ -353,7 +353,7 @@ int  signal_local_rcv( int num_entries,
         if ( local_rcv.local_rcv_posted[i] ) {
             found++;
             wc[i].qp_num = local_rcv.rcv_qp[i]->qp_num;
-            wc[i].src_qp = syscall(SYS_gettid);
+            wc[i].src_qp = getpid();
             wc[i].opcode = IBV_WC_RECV;
             wc[i].status = IBV_WC_SUCCESS;
             wc[i].wr_id = local_rcv.local_rcv_wr[i]->wr_id;
@@ -381,8 +381,9 @@ int  __attribute__((unused)) ibv_poll_cq(struct ibv_cq *cq, int num_entries,
 
     // First, complete local rcv
     n = signal_local_rcv(num_entries, wc);
-    syscall(SYS_membarrier, MEMBARRIER_CMD_SHARED, 0);
+    
     for ( uint16_t i = 0; i< RCV_MAX && (n <= num_entries); i++){
+        syscall(SYS_membarrier, MEMBARRIER_CMD_SHARED, 0);
         // So rcv side has access to data but how do i know when to release it?
         // I will release after signalled=true
         // we can release only Peer wr, different context
@@ -398,24 +399,10 @@ int  __attribute__((unused)) ibv_poll_cq(struct ibv_cq *cq, int num_entries,
             wc[n].imm_data = ctx->sent_arr[i].snd_wr.imm_data;
 
             ctx->sent_arr[i].sent_posted = false; // release slot
-           
+            syscall(SYS_membarrier, MEMBARRIER_CMD_SHARED, 0);
             fprintf(stderr, "PID [%d]/CQ Context %d Completer Shmem Slot %i of SRC_QP [%d] released\n", 
                         getpid(), (int)(uintptr_t) ctx->sent_arr[i].cq_context, i, wc->qp_num);
              
-            //fsync(ctx->shared__mem_fd);
-            #if 0
-            int rc = ftruncate(ctx->shared__mem_fd, sizeof(*ctx));
-            if (rc < 0) {
-                    fprintf(stderr, "%s Failed truncate shmem %i to size %lu \n", __func__, i,
-                    sizeof((*ctx)));
-                    perror("Failed truncate shmem send");
-                    exit(-2);
-            }
-            #endif
-            // ? wc->sl = 1;
-            // ? wc->slid = 1;
-            // ? wc->pkey_index = 1;
-             // ctx->snd_wr[i] = NULL
         }
     }
    
@@ -453,12 +440,13 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
     // free slot is when completed Reception  from Peer is signalled
     for (uint16_t j=0; j < RCV_MAX; j++)
     {
+        syscall(SYS_membarrier, MEMBARRIER_CMD_SHARED, 0);
         // Find free slot 
-        if ( ctx->sent_arr[j].mapped_sgs && (!ctx->sent_arr[j].sent_posted)) {
+        if ( ctx->sent_arr[j].mapped_sgs && ctx->sent_arr[j].sent_posted) {
            // fprintf(stderr, "POST_SENT Shmem SQ %i not consumed\n", j);
             continue;
         }
-        pthread_mutex_lock(&qp->mutex);
+       
         found_free_slot = true;
         // Place WR in shared mem;
         memcpy(&ctx->sent_arr[j].src_qp, qp, sizeof(*qp));
@@ -494,20 +482,14 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
             ctx->sent_arr[j].total_sq_size += wr->sg_list->length;
         }
         ctx->sent_arr[j].sent_posted = true;
-        pthread_mutex_unlock(&qp->mutex);
+        syscall(SYS_membarrier, MEMBARRIER_CMD_SHARED, 0);
+       
         fprintf(stderr, "PID[%d] POST Taking slot %u for QP=%d\n", getpid(), j,qp->qp_num );
-        //fsync(ctx->shared__mem_fd);
-        #if 0
-        int rc = ftruncate(ctx->shared__mem_fd, sizeof(*ctx));
-        if (rc < 0) {
-            fprintf(stderr, "%s Failed truncate shmem %i to size %lu \n", __func__, j,  sizeof(ctx->sent_arr[j] ));
-            perror("Failed truncate shmem send");
-            exit(-2);
-        }
-        #endif
+        
         return 0;
        
     }
+   
     if ( !found_free_slot) {
          fprintf(stderr, "POST_SENT Shmem SQ not consumed, no free slots\n");
          exit(-4);

@@ -1,8 +1,10 @@
 #define _GNU_SOURCE
+#include <sys/time.h>
+#include <sys/types.h>
 #include <stdlib.h>
 #include <stdbool.h>
-#include <sys/time.h>
-
+#include <pthread.h>
+#include <unistd.h>
 #include "debug.h"
 #include "ib.h"
 #include "setup_ib.h"
@@ -40,12 +42,14 @@ void *server_thread (void *arg)
     self = pthread_self ();
     ret  = pthread_setaffinity_np (self, sizeof(cpu_set_t), &cpuset);
     check (ret == 0, "thread[%ld]: failed to set thread affinity", thread_id);
-
+    
+    cq->cq_context = (void *) (uintptr_t) getpid();
     /* pre-post recvs */
     wc = (struct ibv_wc *) calloc (num_wc, sizeof(struct ibv_wc));
     check (wc != NULL, "thread[%ld]: failed to allocate wc", thread_id);
-
+  
     for (i = 0; i < num_concurr_msgs; i++) {
+        
         ret = post_recv (msg_size, lkey, (uint64_t)buf_ptr, qp, buf_ptr);
         check (ret == 0, "thread[%ld]: failed to post recv", thread_id);
         buf_offset = (buf_offset + msg_size) % buf_size;
@@ -58,6 +62,7 @@ void *server_thread (void *arg)
 
     while (stop != true) {
         /* poll cq */
+   
 	n = ibv_poll_cq (cq, num_wc, wc);
 	if (n < 0) {
             check (0, "thread[%ld]: Failed to poll cq", thread_id);
@@ -67,13 +72,16 @@ void *server_thread (void *arg)
             if (wc[i].status != IBV_WC_SUCCESS) {
                 if (wc[i].opcode == IBV_WC_SEND) {
                     check (0, "thread[%ld]: send failed status: %s",
-                           thread_id, ibv_wc_status_str(wc[i].status));
+                        thread_id, ibv_wc_status_str(wc[i].status));
                 } else {
-		    check (0, "thread[%ld]: recv failed status: %s",
-                           thread_id, ibv_wc_status_str(wc[i].status));
-		}
+		                check (0, "thread[%ld]: recv failed status: %s",
+                        thread_id, ibv_wc_status_str(wc[i].status));
+		        }
             }
-
+            if (ops_count == 7){
+                stop =true;
+                continue;
+            }
             if (wc[i].opcode == IBV_WC_RECV) {
                 ops_count += 1;
 		debug ("ops_count = %ld", ops_count);

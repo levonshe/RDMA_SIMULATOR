@@ -111,7 +111,10 @@ void *client_thread_func (void *arg)
             if (wc[i].opcode == IBV_WC_RECV) {
 		ops_count += 1;
 		debug ("ops_count = %ld", ops_count);
-
+        if (ops_count == 8){
+            stop =true;
+            continue;
+        }
 		if (ops_count == NUM_WARMING_UP_OPS) {
 		    gettimeofday (&start, NULL);
 		}
